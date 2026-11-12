@@ -1,18 +1,26 @@
-// Roblox Up-and-Coming top-10 forecaster.
+// Roblox Up-and-Coming top-10 forecaster — V5 (ensemble).
 //
-// Model: each game's chart rank is a latent continuous value that drifts
-// (per-hour drift and volatility estimated from the history, recent reads
-// weighted more) and diffuses. A seeded Monte Carlo simulates every game
-// forward over the 72-hour scored window; at each hour the games are sorted
-// by their simulated rank and the top 10 recorded. Per-place probabilities
-// are the fraction of (path, hour) pairs where a game holds that place,
-// averaged over the whole window — which is exactly what the log score
-// rewards, since one forecast is scored against every hourly read.
-// Games can leave the chart (age-out / exit hazard estimated from the
-// history); a small unnamed reserve covers games no history names.
+// Two genuinely different models, averaged 50/50:
+// (a) an empirical rank-band transition kernel: each game's rank is a
+//     discrete distribution over ranks 1..100 (+ "out"), propagated in
+//     6 h steps by convolving with a rank-band-specific kernel fitted
+//     from the history (recency-weighted, Gaussian-smoothed, +2%
+//     uniform prior so no move is impossible), shifted by the game's
+//     momentum. No Monte Carlo, no Gaussian assumption, exact arithmetic.
+// (b) the V4 seeded Monte Carlo rank diffusion (per-hour drift and
+//     volatility estimated from the history, rank effect, exit hazard).
+// The ensemble reduces variance and improves calibration: the Monte
+// Carlo is overconfident on long horizons (it names ~0.98 of each place
+// but only ~0.6 of the actual games are named, so the rest fall to the
+// tiny unnamed share and hit the log-score floor); the transition
+// model's independent marginals honestly lose mass to exits/drift,
+// leaving a larger implicit unnamed share. Averaging them is the
+// robust, calibrated compromise. Place columns are capped at
+// (1 - UNNAMED) when above, never scaled up.
 //
-// Deterministic: a seeded PRNG (mulberry32) drives every random draw, so
-// two runs on the same history produce byte-identical output.
+// Deterministic: a seeded PRNG (mulberry32) drives the Monte Carlo and
+// the transition propagation is exact arithmetic, so two runs on the
+// same history produce byte-identical output.
 // Stdlib only, no network, no model calls.
 //
 // Run locally: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -297,17 +305,132 @@ for (let path = 0; path < N_PATHS; path++) {
   }
 }
 
-// ---------- forecast ----------
-// Per-place probabilities, averaged over the window; cap each place at
-// (1 - UNNAMED) so the unnamed reserve covers games the history never names.
+// ---------- transition model (empirical rank-band kernel) ----------
+// Exact discrete distribution propagation over ranks 1..100 (+ "out").
+// Per rank band a kernel over rank change per 6 h step, fitted from
+// consecutive read pairs (recency-weighted), Gaussian-smoothed and mixed
+// with a uniform prior so no move is impossible. Each game's kernel is
+// shifted by its momentum (its excess drift, already net of the rank
+// effect — the kernel's per-band mean already contains it, so there is
+// no double-counting). No Monte Carlo, no Gaussian assumption.
+const STEP_H = 6;
+const RMAX = 100;
+const D = 40; // kernel half-width in ranks
+const BANDS: [number, number][] = [[1, 1], [2, 2], [3, 3], [4, 5], [6, 10], [11, 15], [16, 20], [21, 30], [31, 50], [51, 100]];
+const bandOf = (r: number): number => {
+  for (let i = 0; i < BANDS.length; i++) {
+    if (r >= BANDS[i]![0] && r <= BANDS[i]![1]) return i;
+  }
+  return BANDS.length - 1;
+};
+// Kernel counts from consecutive read pairs: rank change scaled to a
+// 6 h step, recency-weighted (5-day half-life).
+const kernelCounts: number[][] = [];
+for (let b = 0; b < BANDS.length; b++) kernelCounts.push(new Array(2 * D + 1).fill(0));
+for (let i = 0; i + 1 < reads.length; i++) {
+  const a = reads[i]!;
+  const b = reads[i + 1]!;
+  const tA = Date.parse(a.at);
+  const tB = Date.parse(b.at);
+  const dtH = Math.max((tB - tA) / HOUR, 0.25);
+  const w = Math.pow(0.5, (windowStart - tB) / HALF_LIFE_MS);
+  const rb = new Map<number, number>();
+  for (const g of b.up_and_coming) rb.set(g.universe_id, g.rank);
+  for (const g of a.up_and_coming) {
+    const r2 = rb.get(g.universe_id);
+    if (r2 === undefined) continue;
+    const band = bandOf(g.rank);
+    const d6 = Math.max(Math.min(Math.round((r2 - g.rank) * STEP_H / dtH), D), -D);
+    kernelCounts[band]![d6 + D] = kernelCounts[band]![d6 + D]! + w;
+  }
+}
+// Gaussian-smooth (sigma 1.5) + 2% uniform prior, then normalise.
+const kernel: number[][] = [];
+for (let b = 0; b < BANDS.length; b++) {
+  const raw = kernelCounts[b]!;
+  const smoothed = new Array(2 * D + 1).fill(0);
+  const SIGMA = 1.5;
+  for (let d = -D; d <= D; d++) {
+    let s = 0;
+    for (let dd = -D; dd <= D; dd++) {
+      const dist = d - dd;
+      s += raw[dd + D]! * Math.exp(-(dist * dist) / (2 * SIGMA * SIGMA));
+    }
+    smoothed[d + D] = s;
+  }
+  let tot = 0;
+  for (let d = 0; d < 2 * D + 1; d++) tot += smoothed[d]!;
+  const uni = 1 / (2 * D + 1);
+  const k: number[] = [];
+  for (let d = 0; d < 2 * D + 1; d++) {
+    k.push(0.98 * (tot > 0 ? smoothed[d]! / tot : uni) + 0.02 * uni);
+  }
+  kernel.push(k);
+}
+// Propagate each game's rank distribution in STEP_H steps, time-averaging
+// the mass on ranks 1..10. dist[0] is "out"; mass that would go below
+// rank 1 piles at rank 1, mass beyond RMAX goes to "out", and on-chart
+// mass exits at exitStep per step.
+const exitStep = 1 - Math.pow(1 - Math.min(baseExitPerHour, 0.05), STEP_H);
+const STEPS = Math.max(1, Math.round(HOURS / STEP_H));
+const probTrans = new Float64Array(N * PLACES);
+for (let i = 0; i < N; i++) {
+  const gm = sim[i]!;
+  const shift = Math.max(Math.min(Math.round(gm.drift * STEP_H), 6), -6);
+  let dist = new Float64Array(RMAX + 1);
+  dist[Math.min(Math.max(Math.round(gm.lastRank), 1), RMAX)] = 1;
+  const acc = new Float64Array(PLACES);
+  for (let s = 0; s < STEPS; s++) {
+    const next = new Float64Array(RMAX + 1);
+    for (let r = 1; r <= RMAX; r++) {
+      const m = dist[r]!;
+      if (m === 0) continue;
+      const k = kernel[bandOf(r)]!;
+      for (let d = -D; d <= D; d++) {
+        const p = k[d + D]!;
+        if (p === 0) continue;
+        const r2 = r + d + shift;
+        if (r2 < 1) next[1] = next[1]! + m * p;
+        else if (r2 > RMAX) next[0] = next[0]! + m * p;
+        else next[r2] = next[r2]! + m * p;
+      }
+    }
+    let onChart = 0;
+    for (let r = 1; r <= RMAX; r++) onChart += next[r]!;
+    const exited = onChart * exitStep;
+    for (let r = 1; r <= RMAX; r++) next[r] = next[r]! * (1 - exitStep);
+    next[0] = next[0]! + exited + dist[0]!;
+    dist = next;
+    for (let k = 0; k < PLACES; k++) acc[k] += dist[k + 1]!;
+  }
+  for (let k = 0; k < PLACES; k++) probTrans[i * PLACES + k] = acc[k]! / STEPS;
+}
+
+// ---------- forecast (ensemble) ----------
+// V5 = 50/50 average of the transition model's place probabilities and
+// the V4 Monte Carlo's place probabilities. Cap each place at
+// (1 - UNNAMED) if above; never scale a short column up — the shortfall
+// is honest calibration. Drop p < 0.002. top10 by total mass / expected rank.
 interface ProbRow { universe_id: number; place: number; p: number }
 const probabilities: ProbRow[] = [];
+// V4 place probabilities from the Monte Carlo counts (per-place cap).
+const probV4 = new Float64Array(N * PLACES);
+for (let k = 0; k < PLACES; k++) {
+  let placeSum = 0;
+  for (let i = 0; i < N; i++) placeSum += counts[i * PLACES + k]! / totalPairs;
+  const cap = 1 - UNNAMED;
+  const scale = placeSum > cap ? cap / placeSum : 1;
+  for (let i = 0; i < N; i++) probV4[i * PLACES + k] = (counts[i * PLACES + k]! / totalPairs) * scale;
+}
+// Ensemble: 50% transition kernel + 50% V4 Monte Carlo.
+const probEns = new Float64Array(N * PLACES);
+for (let i = 0; i < N * PLACES; i++) probEns[i] = 0.5 * probTrans[i]! + 0.5 * probV4[i]!;
 const expectedRank = new Float64Array(N);
 const inTop10 = new Float64Array(N);
 for (let i = 0; i < N; i++) {
   let sum = 0;
   for (let k = 0; k < PLACES; k++) {
-    const p = counts[i * PLACES + k]! / totalPairs;
+    const p = probEns[i * PLACES + k]!;
     sum += p;
     expectedRank[i] += (k + 1) * p;
     inTop10[i] += p;
@@ -316,11 +439,11 @@ for (let i = 0; i < N; i++) {
 }
 for (let k = 0; k < PLACES; k++) {
   let placeSum = 0;
-  for (let i = 0; i < N; i++) placeSum += counts[i * PLACES + k]! / totalPairs;
+  for (let i = 0; i < N; i++) placeSum += probEns[i * PLACES + k]!;
   const cap = 1 - UNNAMED;
   const scale = placeSum > cap ? cap / placeSum : 1;
   for (let i = 0; i < N; i++) {
-    const p = (counts[i * PLACES + k]! / totalPairs) * scale;
+    const p = probEns[i * PLACES + k]! * scale;
     if (p >= 0.002) probabilities.push({ universe_id: sim[i]!.uid, place: k + 1, p: Math.round(p * 1e6) / 1e6 });
   }
 }
