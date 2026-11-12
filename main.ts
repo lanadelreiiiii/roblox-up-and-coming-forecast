@@ -131,7 +131,8 @@ for (const gm of games.values()) {
   const varPerHour = vW > 0 ? vSum / vW : 4;
   gm.vol = Math.min(Math.max(Math.sqrt(varPerHour), 0.5), 6);
   // Shrink drift toward 0 (rank changes are noisy); keep it small.
-  gm.drift = Math.max(Math.min(gm.drift, 0.35), -0.35);
+  // The clamp is wide so genuine momentum (a game breaking out) is not clipped.
+  gm.drift = Math.max(Math.min(gm.drift, 0.6), -0.6);
 }
 // Exit hazard: fraction of games present at a read that are gone at the next,
 // per hour, scaled by how long the game has been seen (older games age out).
@@ -177,9 +178,9 @@ const UNNAMED = Math.min(Math.max(topSlots > 0 ? surprise / topSlots : 0.03, 0.0
 // to nothing over a 72 h window: a chart rank is a relative ordering, so a
 // game that drifts up is pulled back toward its equilibrium rank.
 // Tunables (env, for backtesting): MF_VOL_SCALE, MF_THETA, MF_DRIFT_SCALE.
-const VOL_SCALE = Number(process.env.MF_VOL_SCALE ?? 0.85);
+const VOL_SCALE = Number(process.env.MF_VOL_SCALE ?? 0.30);
 const THETA = Number(process.env.MF_THETA ?? 0);
-const DRIFT_SCALE = Number(process.env.MF_DRIFT_SCALE ?? 0.5);
+const DRIFT_SCALE = Number(process.env.MF_DRIFT_SCALE ?? 1.2);
 const lastRead = reads[reads.length - 1]!;
 const lastChart = [...lastRead.up_and_coming].sort((a, b) => a.rank - b.rank);
 const simUids = new Set<number>(lastChart.map((g) => g.universe_id));
