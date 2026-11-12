@@ -134,7 +134,66 @@ for (const gm of games.values()) {
   // The clamp is wide so genuine momentum (a game breaking out) is not clipped.
   gm.drift = Math.max(Math.min(gm.drift, 0.6), -0.6);
 }
-// Exit hazard: fraction of games present at a read that are gone at the next,
+// Rank effect: the systematic drift that applies to ANY game at a given
+// rank (mean hourly rank change of games starting at that rank). The chart
+// is constantly invaded by new games, so existing games drift DOWNWARD
+// (positive rank change) on average — rank 1 falls slowly (+0.04/h),
+// rank 10 leaks fast (+0.23/h). A game's idiosyncratic momentum is its
+// drift minus the rank effect at its own average rank, so the two are not
+// double-counted: forward drift = rank effect at the current rank +
+// excess (per-game) drift.
+const MAX_RANK = 60;
+const rankEffectRaw = new Float64Array(MAX_RANK + 1);
+const rankEffectW = new Float64Array(MAX_RANK + 1);
+for (let i = 0; i + 1 < reads.length; i++) {
+  const a = reads[i]!;
+  const b = reads[i + 1]!;
+  const tA = Date.parse(a.at);
+  const tB = Date.parse(b.at);
+  const dtH = Math.max((tB - tA) / HOUR, 0.25);
+  const w = Math.pow(0.5, (windowStart - tB) / HALF_LIFE_MS);
+  const rb = new Map<number, number>();
+  for (const g of b.up_and_coming) rb.set(g.universe_id, g.rank);
+  for (const g of a.up_and_coming) {
+    const r2 = rb.get(g.universe_id);
+    if (r2 === undefined) continue;
+    const r = Math.min(Math.max(g.rank, 1), MAX_RANK);
+    rankEffectRaw[r] += w * ((r2 - g.rank) / dtH);
+    rankEffectW[r] += w;
+  }
+}
+let rankEffectMean = 0, rankEffectMeanW = 0;
+for (let r = 1; r <= MAX_RANK; r++) {
+  if (rankEffectW[r]! > 0) { rankEffectMean += rankEffectRaw[r]!; rankEffectMeanW += rankEffectW[r]!; }
+}
+rankEffectMean = rankEffectMeanW > 0 ? rankEffectMean / rankEffectMeanW : 0.1;
+// Smooth across neighbouring ranks (each rank has few observations).
+const rankEffect = new Float64Array(MAX_RANK + 1);
+for (let r = 1; r <= MAX_RANK; r++) {
+  const e = (x: number) => (rankEffectW[x]! > 0 ? rankEffectRaw[x]! / rankEffectW[x]! : rankEffectMean);
+  rankEffect[r] = (e(Math.max(r - 1, 1)) + 2 * e(r) + e(Math.min(r + 1, MAX_RANK))) / 4;
+}
+const rankEffectAt = (rank: number): number => {
+  const r = Math.min(Math.max(Math.round(rank), 1), MAX_RANK);
+  return rankEffect[r]!;
+};
+// Per-game excess drift: the game's own drift minus the rank effect at
+// its recency-weighted mean rank (so momentum is measured relative to
+// what any game at that rank does).
+const meanRankOf = (gm: Game): number => {
+  let wSum = 0, rSum = 0;
+  for (const r of reads) {
+    const t = Date.parse(r.at);
+    const row = r.up_and_coming.find((g) => g.universe_id === gm.uid);
+    if (!row) continue;
+    const w = Math.pow(0.5, (windowStart - t) / HALF_LIFE_MS);
+    rSum += w * row.rank; wSum += w;
+  }
+  return wSum > 0 ? rSum / wSum : gm.lastRank;
+};
+for (const gm of games.values()) {
+  gm.drift = Math.max(Math.min(gm.drift - rankEffectAt(meanRankOf(gm)), 0.6), -0.6);
+}
 // per hour, scaled by how long the game has been seen (older games age out).
 let exitNum = 0, exitDen = 0;
 for (let i = 0; i + 1 < reads.length; i++) {
@@ -216,7 +275,7 @@ for (let path = 0; path < N_PATHS; path++) {
       if (!alive[i]) continue;
       const gm = sim[i]!;
       if (rng.uniform() < gm.exitHazard) { alive[i] = 0; continue; }
-      rankNow[i] = rankNow[i]! + THETA * (meanRank[i]! - rankNow[i]!) + gm.drift * DRIFT_SCALE + gm.vol * VOL_SCALE * rng.gaussian();
+      rankNow[i] = rankNow[i]! + THETA * (meanRank[i]! - rankNow[i]!) + rankEffectAt(rankNow[i]!) + gm.drift * DRIFT_SCALE + gm.vol * VOL_SCALE * rng.gaussian();
       if (rankNow[i]! < 1) rankNow[i] = 1;
       if (rankNow[i]! > CHART_N + 8) alive[i] = 0;
     }
